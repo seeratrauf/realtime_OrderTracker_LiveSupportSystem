@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Order Tracking & Live Support</title>
+<style>
+:root{--bg:#f6f7f9;--card:#fff;--fg:#1b1f24;--mut:#6b7480;--acc:#2563eb;--bd:#e2e5ea}
+@media(prefers-color-scheme:dark){:root{--bg:#111418;--card:#1a1f26;--fg:#e8eaed;--mut:#8b95a1;--bd:#2b323b}}
+*{box-sizing:border-box}body{margin:0;font:14px system-ui,sans-serif;background:var(--bg);color:var(--fg)}
+header{display:flex;gap:12px;align-items:center;padding:12px 16px;border-bottom:1px solid var(--bd);flex-wrap:wrap}
+h1{font-size:17px;margin:0;flex:1}h2{font-size:14px;margin:0 0 8px}
+main{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:12px;padding:12px}
+section{background:var(--card);border:1px solid var(--bd);border-radius:10px;padding:12px;min-width:0}
+button,input,select{font:inherit;padding:6px 10px;border-radius:6px;border:1px solid var(--bd);background:var(--card);color:var(--fg)}
+button{cursor:pointer;background:var(--acc);color:#fff;border:0}button.alt{background:none;color:var(--acc);border:1px solid var(--acc)}
+.row{display:flex;gap:6px;align-items:center;justify-content:space-between;padding:6px 0;border-bottom:1px solid var(--bd);flex-wrap:wrap}
+.pill{font-size:11px;padding:2px 8px;border-radius:99px;background:var(--bd)}.CANCELLED{background:#fecaca;color:#7f1d1d}.DELIVERED{background:#bbf7d0;color:#14532d}
+#log{height:220px;overflow:auto;border:1px solid var(--bd);border-radius:6px;padding:6px;margin-bottom:6px}
+.sys{color:var(--mut);font-style:italic}#alerts{list-style:none;margin:0;padding:0;max-height:260px;overflow:auto}
+#alerts li{padding:4px 0;border-bottom:1px solid var(--bd)}.warning{color:#d97706}small{color:var(--mut)}
+</style></head><body>
+<header><h1>📦 Order Tracking & Live Support</h1>
+<input id="name" placeholder="Your name" value="Guest">
+<select id="role"><option value="customer">Customer</option><option value="agent">Support agent</option></select>
+<small id="conn">connecting…</small></header>
+<main>
+<section><h2>Catalog (REST)</h2><div id="cat"></div></section>
+<section><h2>Orders <small>(REST + WebSocket updates)</small></h2><div id="orders"></div></section>
+<section><h2>Live chat <small id="ct">select an order</small></h2><div id="log"></div><small id="typing"></small>
+<div style="display:flex;gap:6px"><input id="msg" style="flex:1" placeholder="Type a message"><button id="send">Send</button></div></section>
+<section><h2>System alerts (SSE)</h2><ul id="alerts"></ul></section>
+</main>
+<script src="config.js"></script>
+<script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
+<script>
+const API = window.API_URL, $ = (id) => document.getElementById(id);
+const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const j = async (p, o) => { const r = await fetch(API + p, { headers: { 'Content-Type': 'application/json' }, ...o }); const d = await r.json(); if (!r.ok) throw new Error(d.error); return d; };
+let rpcId = 1;
+const rpc = async (method, params) => { const d = await j('/rpc', { method: 'POST', body: JSON.stringify({ jsonrpc: '2.0', method, params, id: rpcId++ }) }); if (d.error) throw new Error(d.error.message); return d.result; };
+const NEXT = { PLACED: 'PROCESSING', PROCESSING: 'SHIPPED', SHIPPED: 'DELIVERED' };
+let orders = [], chatOrder = null;
+const socket = io(API);
+socket.on('connect', () => { $('conn').textContent = '🟢 live'; orders.forEach((o) => socket.emit('order:subscribe', o.id)); });
+socket.on('disconnect', () => $('conn').textContent = '🔴 offline');
+
+async function load() {
+  const cat = await j('/api/v1/catalog');
+  $('cat').innerHTML = cat.map((p) => `<div class="row"><span>${esc(p.name)} <small>$${p.price}</small></span><button data-p="${p.id}">Order</button></div>`).join('');
+  orders = await j('/api/v1/orders'); orders.forEach((o) => socket.emit('order:subscribe', o.id)); draw();
+}
+function draw() {
+  const agent = $('role').value === 'agent';
+  $('orders').innerHTML = orders.slice().reverse().map((o) => `<div class="row"><span>#${o.id} ${esc(o.customer)} <small>$${o.total}</small><br><span class="pill ${o.status}">${o.status}</span></span><span>
+    <button class="alt" data-chat="${o.id}">Chat</button>
+    ${agent && NEXT[o.status] ? `<button data-adv="${o.id}">→ ${NEXT[o.status]}</button>` : ''}
+    ${!agent && ['PLACED', 'PROCESSING'].includes(o.status) ? `<button class="alt" data-cancel="${o.id}">Cancel</button>` : ''}</span></div>`).join('') || '<small>No orders yet</small>';
+}
+const upsert = (o) => { const i = orders.findIndex((x) => x.id === o.id); i < 0 ? orders.push(o) : (orders[i] = o); draw(); };
+socket.on('order:created', (o) => { upsert(o); socket.emit('order:subscribe', o.id); });
+socket.on('order:updated', upsert);
+$('role').onchange = draw;
+
+document.addEventListener('click', async (e) => {
+  const d = e.target.dataset;
+  try {
+    if (d.p) await j('/api/v1/orders', { method: 'POST', body: JSON.stringify({ customer: $('name').value || 'Guest', items: [{ productId: +d.p, qty: 1 }] }) });
+    if (d.cancel) await rpc('cancelOrder', { orderId: +d.cancel });           // JSON-RPC
+    if (d.adv) await j(`/api/v1/orders/${d.adv}/status`, { method: 'PATCH', body: JSON.stringify({ status: NEXT[orders.find((o) => o.id == d.adv).status] }) });
+    if (d.chat) { chatOrder = +d.chat; $('ct').textContent = `· order #${chatOrder}`; $('log').innerHTML = ''; socket.emit('chat:join', { orderId: chatOrder, name: $('name').value || 'Guest', role: $('role').value }); }
+  } catch (err) { alert(err.message); }
+});
+const line = (m) => `<div class="${m.role === 'system' ? 'sys' : ''}"><b>${esc(m.name)}${m.role === 'agent' ? ' 🎧' : ''}:</b> ${esc(m.text)}</div>`;
+socket.on('chat:history', (h) => { $('log').innerHTML = h.map(line).join(''); $('log').scrollTop = 1e9; });
+socket.on('chat:message', (m) => { $('log').insertAdjacentHTML('beforeend', line(m)); $('log').scrollTop = 1e9; });
+socket.on('chat:error', (m) => alert(m));
+socket.on('support:request', (r) => { if ($('role').value === 'agent') addAlert({ level: 'warning', message: `Customer ${r.name} opened chat for order #${r.orderId}`, at: new Date() }); });
+let tt; socket.on('chat:typing', (t) => { $('typing').textContent = `${t.name} is typing…`; clearTimeout(tt); tt = setTimeout(() => $('typing').textContent = '', 1500); });
+const send = () => { if (chatOrder && $('msg').value.trim()) { socket.emit('chat:message', { orderId: chatOrder, text: $('msg').value }); $('msg').value = ''; } };
+$('send').onclick = send; $('msg').onkeydown = (e) => e.key === 'Enter' ? send() : chatOrder && socket.emit('chat:typing', { orderId: chatOrder });
+
+function addAlert(a) { $('alerts').insertAdjacentHTML('afterbegin', `<li class="${a.level}">${new Date(a.at).toLocaleTimeString()} — ${esc(a.message)}</li>`); }
+new EventSource(API + '/events').addEventListener('alert', (e) => addAlert(JSON.parse(e.data))); // SSE
+load();
+</script></body></html>
